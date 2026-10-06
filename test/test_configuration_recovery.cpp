@@ -161,6 +161,61 @@ TEST_CASE("Configuration recovery tests from python addon")
             CHECK(prob == 0.0);
         }
     }
+    SUBCASE("All flip weights zero")
+    {
+        // https://github.com/Qiskit/qiskit-addon-sqd-hpc/issues/64
+        // With target Hamming weight zero, every 1->0 flip weight is zero.
+        constexpr auto num_orbs = 4;
+        constexpr auto half_orbs = num_orbs / 2;
+        const std::vector<std::bitset<num_orbs>> bitstrings(1, 0b1111);
+        const std::vector<double> probs(1, 1.0);
+        std::array<std::vector<double>, 2> occs{
+            std::vector<double>(half_orbs, 1.0), std::vector<double>(half_orbs, 1.0)
+        };
+        auto [mat_rec, probs_rec] =
+            recover_configurations(bitstrings, probs, occs, {0, 0}, rng);
+        REQUIRE(mat_rec.size() == 1);
+        CHECK(mat_rec[0] == 0);
+        CHECK(probs_rec[0] == 1.0);
+    }
+    SUBCASE("Some flip weights zero")
+    {
+        // Two 0->1 flips are needed in the right partition, but only one bit
+        // has nonzero weight; the other must still be flipped.
+        constexpr auto num_orbs = 4;
+        constexpr auto half_orbs = num_orbs / 2;
+        const std::vector<std::bitset<num_orbs>> bitstrings(1);
+        const std::vector<double> probs(1, 1.0);
+        std::array<std::vector<double>, 2> occs{
+            std::vector<double>{0.0, 0.5}, std::vector<double>(half_orbs)
+        };
+        auto [mat_rec, probs_rec] =
+            recover_configurations(bitstrings, probs, occs, {2, 0}, rng);
+        REQUIRE(mat_rec.size() == 1);
+        CHECK(mat_rec[0] == 0b0011);
+    }
+    SUBCASE("Zero flip weights are chosen uniformly")
+    {
+        // From 0b1111 with target {1, 1} and saturated occupancies, each of
+        // the four outcomes (one bit kept per partition) is equally likely.
+        constexpr auto num_orbs = 4;
+        constexpr auto half_orbs = num_orbs / 2;
+        constexpr int num_samples = 4000;
+        const std::vector<std::bitset<num_orbs>> bitstrings(num_samples, 0b1111);
+        const std::vector<double> probs(num_samples, 1.0);
+        std::array<std::vector<double>, 2> occs{
+            std::vector<double>(half_orbs, 1.0), std::vector<double>(half_orbs, 1.0)
+        };
+        auto [mat_rec, probs_rec] =
+            recover_configurations(bitstrings, probs, occs, {1, 1}, rng);
+        REQUIRE(mat_rec.size() == 4);
+        for (std::size_t i = 0; i < mat_rec.size(); ++i) {
+            const auto bs = mat_rec[i].to_ulong();
+            CHECK((bs == 0b0101 || bs == 0b0110 || bs == 0b1001 || bs == 0b1010));
+            // Expected 0.25 each; 0.05 is over 7 standard deviations.
+            CHECK(probs_rec[i] == doctest::Approx(0.25).epsilon(0.2));
+        }
+    }
     SUBCASE("Bad Hamming right")
     {
         constexpr auto num_orbs = 4;

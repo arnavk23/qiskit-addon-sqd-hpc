@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -142,19 +143,45 @@ void _bipartite_bitstring_correcting(
                 static_cast<int>(initial_hamming_weight[s]) -
                 static_cast<int>(num_elec[s])
             );
+            // Gather the eligible bits: those with a nonzero flip weight first
+            // (parallel to `weights`), followed by those with zero weight.
             auto &[indices, weights] = scratch_vectors;
             indices.clear();
             weights.clear();
             for (std::uint64_t j = 0; j < partition_size; ++j) {
-                if (bitstring[j + offset] == flip) {
+                if (bitstring[j + offset] == flip && probs_table[s][flip][j] > 0) {
                     indices.push_back(j + offset);
                     weights.push_back(probs_table[s][flip][j]);
                 }
             }
-            internal::NoReplacementSampler sampler(weights);
-            for (std::size_t i = 0; i < num_flip; ++i) {
-                const auto idx = indices[sampler(rng)];
-                bitstring.flip(idx);
+            const auto num_nonzero = weights.size();
+            for (std::uint64_t j = 0; j < partition_size; ++j) {
+                if (bitstring[j + offset] == flip && !(probs_table[s][flip][j] > 0)) {
+                    indices.push_back(j + offset);
+                }
+            }
+            // The target Hamming weight was validated against the partition
+            // size, so there are always enough eligible bits.
+            assert(indices.size() >= num_flip);
+
+            // Flip bits with nonzero weight first, sampling by weight.
+            std::size_t num_flipped = 0;
+            if (num_nonzero != 0) {
+                internal::NoReplacementSampler sampler(weights);
+                for (; num_flipped < num_flip && num_flipped < num_nonzero;
+                     ++num_flipped) {
+                    bitstring.flip(indices[sampler(rng)]);
+                }
+            }
+
+            // If every bit with nonzero weight has been flipped and more flips
+            // are still needed (e.g., fully saturated occupancies with a target
+            // Hamming weight below the current count), choose uniformly among
+            // the zero-weight bits via a partial Fisher-Yates shuffle.
+            for (auto k = num_nonzero; num_flipped < num_flip; ++k, ++num_flipped) {
+                std::uniform_int_distribution<std::size_t> pick(k, indices.size() - 1);
+                std::swap(indices[k], indices[pick(rng)]);
+                bitstring.flip(indices[k]);
             }
         }
         offset += partition_size;

@@ -1,0 +1,11 @@
+---
+fixes:
+  - |
+    :func:`recover_configurations` no longer aborts or throws when a partition
+    needs more bit flips than there are bits with a nonzero flip probability
+    (for example, fully saturated average occupancies combined with a target
+    Hamming weight below the current count).  Bits with nonzero flip
+    probability are still chosen first, weighted by that probability; any
+    remaining flips are now chosen uniformly at random among the other
+    eligible bits, so the output always has the requested Hamming weight.
+    See `#64 <https://github.com/Qiskit/qiskit-addon-sqd-hpc/issues/64>`__.
