@@ -63,8 +63,17 @@ inline double _p_flip_0_to_1(double ratio_exp, double occ, double eps = 0.01)
 {
     // Occupancy is less than the naive expectation.
     // Flip 0s to 1 with small (<eps) probability in this case.
+    //
+    // The probability is floored at eps * eps so that it never reaches exactly
+    // zero.  Without the floor an orbital with occupancy 0.0 -- one that read 0
+    // in every shot, e.g. a dead qubit -- gets weight 0 and can never be chosen,
+    // and once a sector has fewer nonzero-weight eligible bits than it needs
+    // flips, correction is impossible and the whole batch is rejected.  With it,
+    // such an orbital is merely very unlikely to be chosen: it is drawn only in
+    // proportion to its (tiny) weight, so selection stays weighted rather than
+    // falling back to a uniform choice.
     if (occ < ratio_exp) {
-        return occ * eps / ratio_exp;
+        return std::max(occ * eps / ratio_exp, eps * eps);
     }
 
     // Occupancy is greater than or equal to the naive expectation.
@@ -152,11 +161,11 @@ void _bipartite_bitstring_correcting(
                 }
             }
             internal::NoReplacementSampler sampler(weights);
-            // `recover_configurations` has already established, for every
-            // bitstring and sector, that at least `num_flip` eligible bits carry
-            // a nonzero weight, so every draw below succeeds.  That check cannot
-            // live here: this function runs inside an OpenMP structured block,
-            // where throwing is undefined and aborts under libgomp.
+            // Every flip probability is strictly positive (see `_p_flip_0_to_1`),
+            // and there are at least `num_flip` eligible bits, so every draw below
+            // succeeds.  This must hold by construction: this function runs
+            // inside an OpenMP structured block, where throwing is undefined and
+            // aborts under libgomp.
             assert(num_flip <= sampler.get_remaining_nonzero_weights());
             for (std::size_t i = 0; i < num_flip; ++i) {
                 const auto idx = indices[sampler(rng)];
@@ -270,61 +279,20 @@ template <
     // structured block is undefined, and libgomp terminates the process -- so a
     // condition detected inside the loop would abort rather than raise.
     //
-    // Two things are checked per bitstring: its length, and that the correction
-    // it needs is actually possible.  The latter is what
-    // `NoReplacementSampler::operator()` would otherwise discover mid-loop.
+    // Only the length needs checking.  Correction flips `num_flip` bits drawn
+    // without replacement from the eligible bits (those currently equal to
+    // `flip`), and there are always at least `num_flip` of those, since `num_flip`
+    // is the distance from the current Hamming weight toward the target.  Every
+    // eligible bit carries a strictly positive weight -- `_p_flip_0_to_1` is
+    // floored above zero -- so every draw succeeds and
+    // `NoReplacementSampler::operator()` cannot run out mid-loop.  A caller-
+    // supplied probability table that admits zeros would need a feasibility
+    // check here again.
     for (const auto &bitstring : bitstrings) {
         if (bitstring.size() != 2 * partition_size) {
             QKA_SQD_THROW_INVALID_ARGUMENT_(
                 "Bitstring length must be twice the number of orbitals."
             );
-        }
-
-        // Can each spin sector reach its target Hamming weight?  Correction flips
-        // `num_flip` bits chosen without replacement among the eligible bits --
-        // those currently equal to `flip` -- weighted by `probs_table`.  A bit
-        // whose weight is zero can never be chosen, so the requirement is that at
-        // least `num_flip` eligible bits carry a nonzero weight.
-        //
-        // This mirrors `_bipartite_bitstring_correcting` exactly, so it is a
-        // prediction rather than an approximation: the quantities involved are
-        // fixed by (bitstring, probs_table, num_elec) and no sampling is
-        // involved.  Zero weights are ordinary in practice, not pathological --
-        // `_p_flip_0_to_1` returns exactly 0.0 for an orbital whose average
-        // occupancy is 0.0, which is any orbital empty in every sample.
-        //
-        // The check is still required even though the sampler no longer builds a
-        // std::discrete_distribution (whose constructor asserted a positive sum):
-        // `NoReplacementSampler::operator()` raises when no nonzero weight
-        // remains, and that would happen inside the correction loop, which may be
-        // parallel.
-        const auto n_right_bits =
-            internal::mask_lower_n_bits(bitstring, partition_size).count();
-        const std::array<std::uint64_t, 2> hamming_weight{
-            static_cast<std::uint64_t>(n_right_bits),
-            static_cast<std::uint64_t>(bitstring.count() - n_right_bits)
-        };
-        std::uint64_t offset = 0;
-        for (int s = 0; s < 2; ++s) {
-            if (hamming_weight[s] != num_elec[s]) {
-                const bool flip = bool(hamming_weight[s] > num_elec[s]);
-                const std::uint64_t num_flip = flip ? hamming_weight[s] - num_elec[s]
-                                                    : num_elec[s] - hamming_weight[s];
-                std::uint64_t num_eligible = 0;
-                for (std::size_t j = 0; j < partition_size; ++j) {
-                    if (bitstring[j + offset] == flip && probs_table[s][flip][j] > 0) {
-                        ++num_eligible;
-                    }
-                }
-                if (num_flip > num_eligible) {
-                    // Same type and message as the sampler would have raised, so
-                    // the observable contract is unchanged for serial callers.
-                    QKA_SQD_THROW_RUNTIME_ERROR_(
-                        "Cannot draw more samples than number of nonzero weights."
-                    );
-                }
-            }
-            offset += partition_size;
         }
     }
 

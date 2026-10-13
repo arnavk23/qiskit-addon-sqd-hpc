@@ -1,0 +1,15 @@
+---
+upgrade:
+  - |
+    The bit-flip probabilities used by ``recover_configurations`` are now
+    floored at ``eps * eps`` (``1e-4`` with the default ``eps``) rather than
+    reaching exactly zero.  Previously an orbital whose average occupancy was
+    exactly 0.0 (or, for 1-to-0 flips, exactly 1.0) -- as produced by a qubit
+    that reads the same value in every shot -- could never be flipped, and if a
+    spin sector then had too few flippable bits to reach its target Hamming
+    weight, ``recover_configurations`` raised ``std::runtime_error`` for the
+    whole batch.  Such orbitals are now very unlikely, but not forbidden, to be
+    chosen, so these inputs are corrected rather than rejected.  Orbitals whose
+    unfloored probability was already above the floor are unaffected; for the
+    remaining low-occupancy orbitals the returned bitstrings for a given seed
+    may differ from previous releases.

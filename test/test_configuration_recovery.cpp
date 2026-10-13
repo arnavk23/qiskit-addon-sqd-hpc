@@ -178,15 +178,14 @@ TEST_CASE("Configuration recovery tests from python addon")
             std::invalid_argument
         );
     }
-    SUBCASE("No orbital is eligible to flip")
+    SUBCASE("Saturated occupancies still correct")
     {
         // See https://github.com/Qiskit/qiskit-addon-sqd-hpc/issues/64.  Fully
-        // saturated occupancies drive every 1-to-0 flip probability to zero
-        // (density_s == 0, so _p_flip_1_to_0(0.0, 1.0) == 0.0), while the target
-        // Hamming weight of zero asks for two flips.  No orbital is eligible, so
-        // this is rejected by the up-front validation in `recover_configurations`
-        // rather than failing inside the sampler -- which it must be, since the
-        // correction loop may run under OpenMP, where throwing is not available.
+        // saturated occupancies put every 1-to-0 flip probability on its floor
+        // (density_s == 0, so _p_flip_1_to_0(0.0, 1.0) is eps * eps rather than
+        // zero), while the target Hamming weight of zero asks for two flips per
+        // sector.  Every bit is eligible with a small positive weight, so the
+        // correction succeeds.
         constexpr auto num_orbs = 4;
         constexpr auto half_orbs = num_orbs / 2;
         const std::vector<std::bitset<num_orbs>> bitstrings{0b1111};
@@ -194,11 +193,10 @@ TEST_CASE("Configuration recovery tests from python addon")
         std::array<std::vector<double>, 2> occs{
             std::vector<double>(half_orbs, 1.0), std::vector<double>(half_orbs, 1.0)
         };
-        CHECK_THROWS_WITH_AS(
-            std::ignore = recover_configurations(bitstrings, probs, occs, {0, 0}, rng),
-            "Cannot draw more samples than number of nonzero weights.",
-            std::runtime_error
-        );
+        auto [mat_rec, probs_rec] =
+            recover_configurations(bitstrings, probs, occs, {0, 0}, rng);
+        REQUIRE(mat_rec.size() == 1);
+        CHECK(mat_rec[0] == 0b0000);
     }
     SUBCASE("Bad Hamming left")
     {
@@ -231,28 +229,46 @@ TEST_CASE_TEMPLATE(
     CHECK(bs == bs_expected);
 }
 
-// An input whose correction is impossible, and which must therefore be rejected
-// before the correction loop starts.
+// Flip probabilities are floored above zero, so no orbital is ever frozen out
+// of correction -- not even one whose average occupancy is exactly 0.0 or 1.0,
+// as a qubit stuck at one value in every shot would produce.
+TEST_CASE("Flip probabilities are never zero")
+{
+    constexpr double eps = 0.01;
+    for (const double ratio_exp : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+        for (const double occ : {0.0, 1e-9, 0.1, 0.5, 0.9, 1.0 - 1e-9, 1.0}) {
+            CAPTURE(ratio_exp);
+            CAPTURE(occ);
+            CHECK(
+                Qiskit::addon::sqd::internal::_p_flip_0_to_1(ratio_exp, occ) >=
+                eps * eps
+            );
+            CHECK(
+                Qiskit::addon::sqd::internal::_p_flip_1_to_0(ratio_exp, occ) >=
+                eps * eps
+            );
+        }
+    }
+    // The floor only engages where the unfloored value would fall below it.
+    CHECK(
+        Qiskit::addon::sqd::internal::_p_flip_0_to_1(0.5, 0.0) ==
+        doctest::Approx(eps * eps)
+    );
+    CHECK(
+        Qiskit::addon::sqd::internal::_p_flip_0_to_1(0.5, 0.25) ==
+        doctest::Approx(0.25 * eps / 0.5)
+    );
+}
+
+// Inputs that main previously rejected up front: each needs more flips than
+// there are eligible bits with a nonzero *unfloored* weight.
 //
-// Both spin sectors have orbitals with average occupancy 0.0, and _p_flip_0_to_1
-// returns exactly 0.0 for those -- so those bits are eligible to flip but can
-// never be chosen.  Asking for more flips than there are nonzero-weight eligible
-// bits is unsatisfiable.
-//
-// Detecting this up front is a correctness requirement, not a nicety.  Reaching
-// it inside the loop meant:
-//
-//   * under OpenMP, throwing out of a structured block, which is undefined and
-//     which libgomp turns into an abort -- so a catchable input error became a
-//     core dump, at any thread count; and
-//   * in *any* build, constructing a std::discrete_distribution over all-zero
-//     weights, which libstdc++ aborts on wherever __glibcxx_assert is live --
-//     including an ordinary -O0 build, not only a hardened one.
-//
-// Gated only on exceptions being available: with QKA_SQD_DISABLE_EXCEPTIONS the
-// throw macros call std::terminate(), which cannot be caught by design.
-#if !QKA_SQD_DISABLE_EXCEPTIONS
-TEST_CASE("recover_configurations rejects an uncorrectable bitstring up front")
+// Both spin sectors have orbitals with average occupancy 0.0.  Before the floor,
+// _p_flip_0_to_1 returned exactly 0.0 for those, so they could never be chosen.
+//   0: needs 2 alpha flips, only 1 alpha bit had a nonzero weight.
+//   4: the eligible alpha bits all had weight 0.
+// Both must now reach the target Hamming weight.
+TEST_CASE("recover_configurations corrects despite zero-occupancy orbitals")
 {
     constexpr unsigned int num_orbs = 6;
     std::array<std::vector<double>, 2> occs{
@@ -260,28 +276,23 @@ TEST_CASE("recover_configurations rejects an uncorrectable bitstring up front")
     };
     std::vector<double> probs{1.0};
 
-    // Two inputs that fail for the two different reasons described above.
-    //   0: needs 2 alpha flips, only 1 alpha bit carries a nonzero weight.
-    //   4: the eligible alpha bits all carry weight 0, so the weight vector handed
-    //      to the sampler is entirely zero -- the case that aborts even serially.
     for (unsigned int value : {0u, 4u}) {
+        CAPTURE(value);
         std::vector<std::bitset<num_orbs>> bitstrings{std::bitset<num_orbs>(value)};
         std::mt19937 rng(1234u);
-        // Bound to a variable rather than discarded: recover_configurations is
-        // [[nodiscard]], and the macro expands its argument into an expression
-        // statement.
-        CHECK_THROWS_WITH_AS(
-            [[maybe_unused]] const auto unused =
-                recover_configurations(bitstrings, probs, occs, {2, 2}, rng),
-            "Cannot draw more samples than number of nonzero weights.",
-            std::runtime_error
+        const auto result =
+            recover_configurations(bitstrings, probs, occs, {2, 2}, rng);
+        REQUIRE(result.first.size() == 1);
+        CHECK(result.first[0].count() == 4);
+        CHECK(
+            Qiskit::addon::sqd::internal::mask_lower_n_bits(result.first[0], 3)
+                .count() == 2
         );
     }
 }
 
-// The complement of the case above: zero weights are only a problem when they
-// leave too few eligible bits.  An orbital with occupancy 0.0 is ordinary input
-// and must still be corrected, not rejected.
+// An orbital with occupancy 0.0 is ordinary input and must be corrected, not
+// rejected, including when enough higher-weight bits are available.
 TEST_CASE("recover_configurations still corrects when zero weights leave enough bits")
 {
     constexpr unsigned int num_orbs = 6;
@@ -297,7 +308,6 @@ TEST_CASE("recover_configurations still corrects when zero weights leave enough 
     REQUIRE(result.first.size() == 1);
     CHECK(result.first[0].count() == 2); // reached the target Hamming weight
 }
-#endif // !QKA_SQD_DISABLE_EXCEPTIONS
 
 #if defined(_OPENMP)
 
