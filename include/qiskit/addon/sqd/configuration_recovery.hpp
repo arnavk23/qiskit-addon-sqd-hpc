@@ -612,8 +612,10 @@ template <
     // uniform_real_distribution's unspecified algorithm, so the diff stands.)
     const std::uint64_t base_seed =
         static_cast<std::uint64_t>(rng()) ^ (static_cast<std::uint64_t>(rng()) << 32);
-    if constexpr (!internal::is_counter_based_rng_v<RNGType> &&
-                  internal::is_seedable_rng_v<RNGType>) {
+    if constexpr (
+        !internal::is_counter_based_rng_v<RNGType> &&
+        internal::is_seedable_rng_v<RNGType>
+    ) {
         // The thread id an OpenMP build would see here is 0, so this is the
         // `omp_get_thread_num() + 1` seed of that path with the id fixed at 0.
         // Seedability is required because a generator that has no `seed()` is
