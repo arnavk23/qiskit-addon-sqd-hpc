@@ -17,6 +17,10 @@ The default table can be obtained, for inspection or modification, with:
 
 .. doxygenfunction:: Qiskit::addon::sqd::flip_probabilities_from_occupancies
 
+A bit whose weight is zero is chosen only when too few bits with positive weight are eligible, in which case the remaining flips are chosen uniformly.  Whether, and how often, that will happen can be checked before calling ``recover_configurations``:
+
+.. doxygenfunction:: Qiskit::addon::sqd::num_uniform_flips
+
 Classes
 =======
 

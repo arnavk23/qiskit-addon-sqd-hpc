@@ -1,0 +1,20 @@
+---
+features:
+  - |
+    A new function, :cpp:func:`Qiskit::addon::sqd::num_uniform_flips`, reports
+    how many of the bit flips needed to correct a bitstring would have to be
+    chosen uniformly at random rather than by weight.  Calling it before
+    :cpp:func:`recover_configurations` lets a caller detect, for example,
+    orbitals whose average occupancy is exactly 0 or 1, which can never be
+    chosen by weight.
+    See `#71 <https://github.com/Qiskit/qiskit-addon-sqd-hpc/issues/71>`__.
+upgrade:
+  - |
+    :cpp:func:`recover_configurations` no longer throws ``std::runtime_error``
+    when a spin species needs more bit flips than it has eligible bits with a
+    positive flip weight.  Bits with a positive weight are still flipped first,
+    chosen by weight; the remaining flips are now chosen uniformly at random
+    among the zero-weight eligible bits, so every output has the requested
+    Hamming weight.  Use :cpp:func:`Qiskit::addon::sqd::num_uniform_flips` to
+    detect this case in advance.
+    See `#71 <https://github.com/Qiskit/qiskit-addon-sqd-hpc/issues/71>`__.

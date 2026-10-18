@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -55,7 +56,10 @@ namespace sqd
 ///
 /// Weights are relative: only their ratios among the eligible bits of a
 /// single spin species matter, so they need not be normalized.  They must be
-/// finite and non-negative.
+/// finite and non-negative.  A bit with weight zero is chosen only if a spin
+/// species needs more flips than it has eligible bits with positive weight; the
+/// remaining flips are then chosen uniformly among the zero-weight bits (see
+/// `num_uniform_flips()`).
 ///
 /// A default table, derived from average orbital occupancies, is produced by
 /// `flip_probabilities_from_occupancies()`; it may be modified before being
@@ -206,25 +210,47 @@ void _bipartite_bitstring_correcting(
                 static_cast<int>(initial_hamming_weight[s]) -
                 static_cast<int>(num_elec[s])
             );
+            // Gather the eligible bits: those with a positive flip weight first
+            // (parallel to `weights`), followed by those with zero weight.
             auto &[indices, weights] = scratch_vectors;
             indices.clear();
             weights.clear();
             for (std::uint64_t j = 0; j < partition_size; ++j) {
-                if (bitstring[j + offset] == flip) {
+                if (bitstring[j + offset] == flip && flip_probs(s, flip, j) > 0) {
                     indices.push_back(j + offset);
                     weights.push_back(flip_probs(s, flip, j));
                 }
             }
-            internal::NoReplacementSampler sampler(weights);
-            // `recover_configurations` has already established, for every
-            // bitstring and sector, that at least `num_flip` eligible bits carry
-            // a nonzero weight, so every draw below succeeds.  That check cannot
-            // live here: this function runs inside an OpenMP structured block,
-            // where throwing is undefined and aborts under libgomp.
-            assert(num_flip <= sampler.get_remaining_nonzero_weights());
-            for (std::size_t i = 0; i < num_flip; ++i) {
-                const auto idx = indices[sampler(rng)];
-                bitstring.flip(idx);
+            const auto num_weighted = weights.size();
+            for (std::uint64_t j = 0; j < partition_size; ++j) {
+                if (bitstring[j + offset] == flip && !(flip_probs(s, flip, j) > 0)) {
+                    indices.push_back(j + offset);
+                }
+            }
+            // `recover_configurations` has already checked the target Hamming
+            // weight against the partition size, so there are always enough
+            // eligible bits.
+            assert(indices.size() >= num_flip);
+
+            // Flip bits with a positive weight first, sampling by weight.  The
+            // sampler only ever sees positive weights, so no draw can fail.
+            std::uint64_t num_flipped = 0;
+            if (num_weighted != 0) {
+                internal::NoReplacementSampler sampler(weights);
+                for (; num_flipped < num_flip && num_flipped < num_weighted;
+                     ++num_flipped) {
+                    bitstring.flip(indices[sampler(rng)]);
+                }
+            }
+
+            // If more flips are still needed once every positive-weight bit has
+            // been flipped, choose the rest uniformly among the zero-weight
+            // bits, via a partial Fisher-Yates shuffle.  `num_uniform_flips()`
+            // predicts how many flips take this path.
+            for (auto k = num_weighted; num_flipped < num_flip; ++k, ++num_flipped) {
+                std::uniform_int_distribution<std::size_t> pick(k, indices.size() - 1);
+                std::swap(indices[k], indices[pick(rng)]);
+                bitstring.flip(indices[k]);
             }
         }
         offset += partition_size;
@@ -314,6 +340,96 @@ inline void _validate_flip_probabilities(const FlipProbabilityTable &flip_probs)
     return flip_probs;
 }
 
+/// Count the bit flips that configuration recovery would have to choose
+/// uniformly, rather than by weight, when correcting a bitstring.
+///
+/// `recover_configurations()` corrects each spin species by flipping bits that
+/// hold the value to be flipped, chosen by weight from `flip_probs`.  A bit
+/// whose weight is zero can never be chosen that way.  If a species needs more
+/// flips than it has eligible bits with a positive weight, every such bit is
+/// flipped and the remaining flips are chosen uniformly at random among the
+/// zero-weight eligible bits.  Those remaining flips are not informed by
+/// `flip_probs`.
+///
+/// This function returns the number of such flips, summed over both spin
+/// species, without sampling anything.  It is zero exactly when the correction
+/// of `bitstring` is guided entirely by `flip_probs`.  Calling it on each input
+/// bitstring before `recover_configurations()` tells a caller whether, and how
+/// much, uniform filling will occur:
+///
+/// @code
+/// auto table = flip_probabilities_from_occupancies(avg_occupancies, num_elec);
+/// for (const auto &bitstring : bitstrings) {
+///     if (num_uniform_flips(bitstring, table, num_elec) != 0) {
+///         // e.g., warn, or floor the zero weights in `table`
+///     }
+/// }
+/// @endcode
+///
+/// Zero weights arise from ordinary data, not only from hand-built tables:
+/// `flip_probabilities_from_occupancies()` gives weight zero to flipping a 0 in
+/// an orbital whose average occupancy is exactly 0, and to flipping a 1 in an
+/// orbital whose average occupancy is exactly 1.
+///
+/// @param[in] bitstring The bitstring to be corrected.  Its size must be twice
+///     `flip_probs.num_orbitals()`.
+/// @param[in] flip_probs Relative weights for flipping each bit.
+/// @param[in] num_elec Size-2 `std::array` containing the number of spin-up and
+///     spin-down electrons in the system, respectively.
+///
+/// @tparam BitstringType Type of `bitstring`, compatible with
+///     `boost::dynamic_bitset<>`.
+///
+/// @return The number of flips that would be chosen uniformly.
+template <typename BitstringType>
+[[nodiscard]] std::uint64_t num_uniform_flips(
+    const BitstringType &bitstring, const FlipProbabilityTable &flip_probs,
+    std::array<std::uint64_t, 2> num_elec
+)
+{
+    const auto partition_size = flip_probs.num_orbitals();
+    if (num_elec[0] > partition_size || num_elec[1] > partition_size) {
+        QKA_SQD_THROW_INVALID_ARGUMENT_(
+            "Desired Hamming weight cannot be larger than the number of orbitals."
+        );
+    }
+    if (bitstring.size() != 2 * partition_size) {
+        QKA_SQD_THROW_INVALID_ARGUMENT_(
+            "Bitstring length must be twice the number of orbitals."
+        );
+    }
+
+    // This mirrors `_bipartite_bitstring_correcting` exactly: the quantities
+    // involved are fixed by (bitstring, flip_probs, num_elec), so the count is a
+    // prediction rather than an estimate.
+    const auto n_right_bits =
+        internal::mask_lower_n_bits(bitstring, partition_size).count();
+    const std::array<std::uint64_t, 2> hamming_weight{
+        static_cast<std::uint64_t>(n_right_bits),
+        static_cast<std::uint64_t>(bitstring.count() - n_right_bits)
+    };
+    std::uint64_t total = 0;
+    std::uint64_t offset = 0;
+    for (std::size_t s = 0; s < 2; ++s) {
+        if (hamming_weight[s] != num_elec[s]) {
+            const bool flip = bool(hamming_weight[s] > num_elec[s]);
+            const std::uint64_t num_flip = flip ? hamming_weight[s] - num_elec[s]
+                                                : num_elec[s] - hamming_weight[s];
+            std::uint64_t num_weighted = 0;
+            for (std::size_t j = 0; j < partition_size; ++j) {
+                if (bitstring[j + offset] == flip && flip_probs(s, flip, j) > 0) {
+                    ++num_weighted;
+                }
+            }
+            if (num_flip > num_weighted) {
+                total += num_flip - num_weighted;
+            }
+        }
+        offset += partition_size;
+    }
+    return total;
+}
+
 /// Refine bitstrings based on a table of flip probabilities and a target
 /// Hamming weight.
 ///
@@ -321,6 +437,13 @@ inline void _validate_flip_probabilities(const FlipProbabilityTable &flip_probs)
 /// target is corrected by flipping bits, chosen according to `flip_probs` (see
 /// `FlipProbabilityTable`).  Corrected bitstrings that coincide are merged, and
 /// their probabilities summed.
+///
+/// Bits with weight zero are never chosen while a bit with positive weight
+/// remains eligible.  If a spin species needs more flips than it has eligible
+/// bits with positive weight, the remaining flips are chosen uniformly at random
+/// among its zero-weight eligible bits, so every output has the target Hamming
+/// weight.  Use `num_uniform_flips()` to find out in advance whether this will
+/// happen.
 ///
 ///   - A counter-based engine (one whose `set_counter` accepts its counter
 ///     type, such as the C++26 `std::philox_engine`) is keyed by bitstring
@@ -387,61 +510,14 @@ template <
     // structured block is undefined, and libgomp terminates the process -- so a
     // condition detected inside the loop would abort rather than raise.
     //
-    // Two things are checked per bitstring: its length, and that the correction
-    // it needs is actually possible.  The latter is what
-    // `NoReplacementSampler::operator()` would otherwise discover mid-loop.
+    // Once the target Hamming weight is known to fit in a partition, correction
+    // cannot fail: flips that cannot be chosen by weight are chosen uniformly
+    // (see `num_uniform_flips()`).  So the only per-bitstring check is length.
     for (const auto &bitstring : bitstrings) {
         if (bitstring.size() != 2 * partition_size) {
             QKA_SQD_THROW_INVALID_ARGUMENT_(
                 "Bitstring length must be twice the number of orbitals."
             );
-        }
-
-        // Can each spin sector reach its target Hamming weight?  Correction flips
-        // `num_flip` bits chosen without replacement among the eligible bits --
-        // those currently equal to `flip` -- weighted by `flip_probs`.  A bit
-        // whose weight is zero can never be chosen, so the requirement is that at
-        // least `num_flip` eligible bits carry a nonzero weight.
-        //
-        // This mirrors `_bipartite_bitstring_correcting` exactly, so it is a
-        // prediction rather than an approximation: the quantities involved are
-        // fixed by (bitstring, flip_probs, num_elec) and no sampling is
-        // involved.  Zero weights are ordinary in practice, not pathological --
-        // `_p_flip_0_to_1` returns exactly 0.0 for an orbital whose average
-        // occupancy is 0.0, which is any orbital empty in every sample.
-        //
-        // The check is still required even though the sampler no longer builds a
-        // std::discrete_distribution (whose constructor asserted a positive sum):
-        // `NoReplacementSampler::operator()` raises when no nonzero weight
-        // remains, and that would happen inside the correction loop, which may be
-        // parallel.
-        const auto n_right_bits =
-            internal::mask_lower_n_bits(bitstring, partition_size).count();
-        const std::array<std::uint64_t, 2> hamming_weight{
-            static_cast<std::uint64_t>(n_right_bits),
-            static_cast<std::uint64_t>(bitstring.count() - n_right_bits)
-        };
-        std::uint64_t offset = 0;
-        for (int s = 0; s < 2; ++s) {
-            if (hamming_weight[s] != num_elec[s]) {
-                const bool flip = bool(hamming_weight[s] > num_elec[s]);
-                const std::uint64_t num_flip = flip ? hamming_weight[s] - num_elec[s]
-                                                    : num_elec[s] - hamming_weight[s];
-                std::uint64_t num_eligible = 0;
-                for (std::size_t j = 0; j < partition_size; ++j) {
-                    if (bitstring[j + offset] == flip && flip_probs(s, flip, j) > 0) {
-                        ++num_eligible;
-                    }
-                }
-                if (num_flip > num_eligible) {
-                    // Same type and message as the sampler would have raised, so
-                    // the observable contract is unchanged for serial callers.
-                    QKA_SQD_THROW_RUNTIME_ERROR_(
-                        "Cannot draw more samples than number of nonzero weights."
-                    );
-                }
-            }
-            offset += partition_size;
         }
     }
 
@@ -536,10 +612,8 @@ template <
     // uniform_real_distribution's unspecified algorithm, so the diff stands.)
     const std::uint64_t base_seed =
         static_cast<std::uint64_t>(rng()) ^ (static_cast<std::uint64_t>(rng()) << 32);
-    if constexpr (
-        !internal::is_counter_based_rng_v<RNGType> &&
-        internal::is_seedable_rng_v<RNGType>
-    ) {
+    if constexpr (!internal::is_counter_based_rng_v<RNGType> &&
+                  internal::is_seedable_rng_v<RNGType>) {
         // The thread id an OpenMP build would see here is 0, so this is the
         // `omp_get_thread_num() + 1` seed of that path with the id fixed at 0.
         // Seedability is required because a generator that has no `seed()` is
